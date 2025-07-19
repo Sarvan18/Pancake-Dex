@@ -1,0 +1,149 @@
+const {
+  expectEvent, // Assertions for emitted events
+  time,
+  expectRevert,
+  balance
+} = require("@openzeppelin/test-helpers");
+var chai = require("chai");
+const { web3, artifacts } = require("hardhat");
+const {
+  TASK_COMPILE_SOLIDITY_GET_ARTIFACT_FROM_COMPILATION_OUTPUT
+} = require("hardhat/builtin-tasks/task-names");
+var expect = chai.expect;
+const Swag_Token_CONTRACT = artifacts.require("Cmpk");
+const MetalVest_CONTRACT = artifacts.require("MetalVest");
+
+contract("Metal Vesting Contract Testing", (accounts) => {
+  const [owner, user] = accounts;
+  const claimRate = "10000000000000000000";
+  const vest_rate = "12000000000000000000";
+
+  before(async function () {
+    swag_Token_Instance = await Swag_Token_CONTRACT.new(owner);
+    vesting_Instance = await MetalVest_CONTRACT.new(
+      owner,
+      owner, // signer is owner
+      swag_Token_Instance.address,
+      claimRate,
+      vest_rate
+    );
+  });
+
+  // Helper to get EIP-712 domain separator
+  async function getDomainSeparator() {
+    return web3.utils.keccak256(
+      web3.eth.abi.encodeParameters(
+        ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+        [
+          web3.utils.keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+          ),
+          web3.utils.keccak256("Metal"),
+          web3.utils.keccak256("1"),
+          await web3.eth.getChainId(),
+          vesting_Instance.address
+        ]
+      )
+    );
+  }
+
+  // Proper EIP-712 signing function that matches contract expectations
+  async function createValidSignature(userAddress, amount, deadline) {
+    const nonce = (await vesting_Instance.nonce(userAddress)).toString();
+    const chainId = await web3.eth.getChainId();
+
+    // Prepare the typed data
+    const typedData = {
+      types: {
+        EIP712Domain: [
+          { name: "name", type: "string" },
+          { name: "version", type: "string" },
+          { name: "chainId", type: "uint256" },
+          { name: "verifyingContract", type: "address" }
+        ],
+        Claim: [
+          { name: "user", type: "address" },
+          { name: "token", type: "address" },
+          { name: "amount", type: "uint256" },
+          { name: "deadline", type: "uint256" },
+          { name: "nonce", type: "uint256" }
+        ]
+      },
+      primaryType: "Claim",
+      domain: {
+        name: "Metal",
+        version: "1",
+        chainId: chainId,
+        verifyingContract: vesting_Instance.address
+      },
+      message: {
+        user: userAddress,
+        token: swag_Token_Instance.address,
+        amount: amount.toString(),
+        deadline: deadline.toString(),
+        nonce: nonce
+      }
+    };
+
+    // Use Hardhat's provider to sign the typed data
+    const signature = await network.provider.send("eth_signTypedData_v4", [
+      owner,
+      typedData
+    ]);
+
+    return signature;
+  }
+
+  describe("Signature Verification", () => {
+    it("should correctly verify signatures using Web3.js", async () => {
+      const amount = web3.utils.toWei("100", "ether");
+      const deadline = (await time.latest()).add(time.duration.seconds(300));
+
+      const signature = await createValidSignature(user, amount, deadline);
+
+      // Verify through contract
+      const recovered = await vesting_Instance.sigOwner(
+        user,
+        swag_Token_Instance.address,
+        amount,
+        deadline,
+        signature
+      );
+
+      expect(recovered.toLowerCase()).to.equal(owner.toLowerCase());
+    });
+  });
+
+  describe("Claim Functionality", () => {
+    it("should process valid claims", async () => {
+      const amount = web3.utils.toWei("50", "ether");
+      const deadline = (await time.latest()).add(time.duration.seconds(300));
+
+      // Get properly formatted signature
+      const signature = await createValidSignature(user, amount, deadline);
+
+      // Fund contract
+      await swag_Token_Instance.transfer(vesting_Instance.address, amount, {
+        from: owner
+      });
+
+      // Execute claim
+      const tx = await vesting_Instance.claim(
+        user,
+        amount,
+        deadline,
+        signature,
+        { from: user }
+      );
+
+      // Verify stake created
+      const userData = await vesting_Instance.userInfo(user);
+      expect(userData.stakeIds.toString()).to.equal("1");
+
+      // Verify events
+      const stakeEvents = tx.logs.filter((x) => x.event === "Staked");
+      expect(stakeEvents.length).to.equal(1);
+      expect(stakeEvents[0].args.user).to.equal(user);
+    });
+  });
+});
